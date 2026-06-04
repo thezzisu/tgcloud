@@ -1,0 +1,190 @@
+openapi: 3.1.0
+info:
+  title: tgcloud Agent API
+  version: 1.0.0
+  description: REST API for AI agents to access WeChat data from tgcloud instances.
+
+servers:
+  - url: '{baseUrl}'
+    variables:
+      baseUrl:
+        default: http://localhost:36080
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 'Personal Access Token: tgcp_...'
+
+paths:
+  /api/agent/instances:
+    get:
+      summary: List accessible instances
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instances:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        name: { type: string }
+
+  /api/agent/instances/{id}/status:
+    get:
+      summary: Instance runtime and WeChat status
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instanceId: { type: string }
+                  runtime: { type: string, enum: [running, stopped, missing] }
+                  wechat:
+                    type: object
+                    properties:
+                      phase: { type: string }
+                      installed: { type: boolean }
+                      version: { type: string }
+
+  /api/agent/instances/{id}/sessions:
+    get:
+      summary: List WeChat sessions/chats
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: top
+          in: query
+          schema: { type: integer }
+      responses:
+        '200':
+          description: JSON output from tg sessions
+
+  /api/agent/instances/{id}/messages:
+    get:
+      summary: Read messages from a session
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: session
+          in: query
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer }
+        - name: since
+          in: query
+          schema: { type: string }
+        - name: all_time
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: JSON output from tg messages
+
+  /api/agent/instances/{id}/search:
+    get:
+      summary: Full-text search across sessions
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer }
+        - name: since
+          in: query
+          schema: { type: string }
+        - name: all_time
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: JSON output from tg search
+
+  /api/agent/instances/{id}/query:
+    post:
+      summary: Structured query with filters
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                session: { type: string }
+                contains: { type: string }
+                not: { type: string }
+                since: { type: string }
+                fields: { type: string }
+                limit: { type: integer }
+                all_time: { type: boolean }
+      responses:
+        '200':
+          description: JSON output from tg query
+
+  /api/agent/instances/{id}/refresh:
+    post:
+      summary: Refresh decrypted message cache
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Refresh result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  detail: { type: string }
+
+  /api/agent/instances/{id}/doctor:
+    get:
+      summary: Run tg diagnostics
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: session
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: JSON output from tg doctor

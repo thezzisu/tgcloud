@@ -1,0 +1,22 @@
+# tgcloud — 微信 GUI (WOC) + Agent REST API
+# Panel is the sole entrypoint; WeChat instances are created dynamically by the panel.
+services:
+  panel:
+    image: ${TGCLOUD_IMAGE_PREFIX:-git.pku.edu.cn/thezzisu}/tgcloud-panel:${TGCLOUD_VERSION:-latest}
+    container_name: tgcloud-panel
+    environment:
+      - PORT=8080
+      - WOC_WECHAT_IMAGE=${TGCLOUD_IMAGE_PREFIX:-git.pku.edu.cn/thezzisu}/tgcloud-wechat:${TGCLOUD_VERSION:-latest}
+      - PUID=${TGCLOUD_PUID:-1000}
+      - PGID=${TGCLOUD_PGID:-1000}
+      - TZ=${TGCLOUD_TZ:-Asia/Shanghai}
+      - WOC_VIDEO_DEVICES=${TGCLOUD_VIDEO_DEVICES:-}
+      - PANEL_ADMIN_USER=${TGCLOUD_USER:-admin}
+      - PANEL_ADMIN_PASSWORD=${TGCLOUD_PASSWORD:-changeme}
+      - PANEL_DATA=/data/accounts.json
+    volumes:
+      - ./data-panel:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "${TGCLOUD_HTTP_PORT:-36080}:8080"
+    restart: unless-stopped

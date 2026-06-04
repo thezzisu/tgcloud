@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-panel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build panel image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./images/panel/Dockerfile
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=panel
+          cache-to: type=gha,mode=max,scope=panel
+
+  build-wechat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build wechat image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./images/wechat/Dockerfile
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=wechat
+          cache-to: type=gha,mode=max,scope=wechat

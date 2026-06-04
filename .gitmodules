@@ -1,0 +1,6 @@
+[submodule "3rd/WechatOnCloud"]
+	path = 3rd/WechatOnCloud
+	url = https://github.com/Gloridust/WechatOnCloud.git
+[submodule "3rd/tg"]
+	path = 3rd/tg
+	url = https://github.com/xiaotianxt/tg.git
