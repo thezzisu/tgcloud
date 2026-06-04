@@ -7,18 +7,13 @@ WORKDIR /web
 COPY 3rd/WechatOnCloud/panel/web/package.json ./
 RUN npm install
 COPY 3rd/WechatOnCloud/panel/web/ ./
-# Add Tokens page
+# Add TokensModal component
 COPY images/panel/overlay/web/src/pages/Tokens.tsx ./src/pages/Tokens.tsx
-# Patch AppShell to add Tokens route + nav item
-RUN sed -i \
-  "s|import Admin from './pages/Admin';|import Admin from './pages/Admin';\nimport Tokens from './pages/Tokens';|" \
-  src/AppShell.tsx && \
-  sed -i \
-  's|<Route path="/admin"|<Route path="/tokens" element={<Tokens />} />\n            <Route path="/admin"|' \
-  src/AppShell.tsx && \
-  sed -i \
-  's|<button className={.sb-item. + (loc.pathname === ./admin.|<button className={"sb-item" + (loc.pathname === "/tokens" ? " on" : "")} onClick={() => go("/tokens")} title="API 令牌"><span className="sb-ic"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>{!collapsed \&\& <span className="sb-label">API 令牌</span>}</button>\n        \0|' \
-  src/AppShell.tsx
+# Patch Admin.tsx: import TokensModal + add state + button + modal render
+RUN sed -i "1i import { TokensModal } from './Tokens';" src/pages/Admin.tsx && \
+    sed -i '/const \[renameInst/a \ \ const [showTokens, setShowTokens] = useState(false);' src/pages/Admin.tsx && \
+    sed -i 's|<button className="btn btn-primary inst-act-wide" onClick={onChangePassword}>|<button className="btn inst-act-wide" onClick={() => setShowTokens(true)}>API 令牌</button>\n              <button className="btn btn-primary inst-act-wide" onClick={onChangePassword}>|' src/pages/Admin.tsx && \
+    sed -i '/{renameInst && /i \ \ \ \ \ \ {showTokens \&\& <TokensModal onClose={() => setShowTokens(false)} />}' src/pages/Admin.tsx
 RUN npm run build
 
 # --- 2) Backend runtime ---
