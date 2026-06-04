@@ -5,7 +5,6 @@ import {
   findInstance,
   userCanAccess,
   userInstances,
-  listInstances,
   type User,
   type Instance,
 } from './store.js';
@@ -19,25 +18,28 @@ import {
   type PatRecord,
 } from './pat.js';
 import {
-  tgExec,
   tgRefresh,
   tgSessions,
+  tgUnread,
   tgMessages,
   tgSearch,
   tgQuery,
   tgDoctor,
+  tgExport,
+  tgMedia,
+  ensureInitialized,
+  classifyError,
+  readFileFromContainer,
+  listFilesInContainer,
+  type TgExecResult,
 } from './tg-exec.js';
 import { instanceRuntime, wechatStatus } from './docker.js';
-
-// PAT storage is embedded in the user records in accounts.json.
-// We access it via a simple in-memory map rebuilt on load.
-// The store module will be patched to include `tokens: PatRecord[]` on User.
 
 interface UserWithTokens extends User {
   tokens?: PatRecord[];
 }
 
-// --- PAT resolution from Bearer header ---
+// --- PAT auth ---
 function extractBearer(req: FastifyRequest): string | null {
   const auth = req.headers.authorization;
   if (!auth) return null;
@@ -48,10 +50,8 @@ function extractBearer(req: FastifyRequest): string | null {
   return token;
 }
 
-// Brute linear scan over all users' tokens. Fine for typical scale (<100 tokens).
 function resolveToken(token: string, getUsers: () => UserWithTokens[]): { user: UserWithTokens; pat: PatRecord } | null {
-  const users = getUsers();
-  for (const user of users) {
+  for (const user of getUsers()) {
     if (!user.tokens || user.disabled) continue;
     for (const pat of user.tokens) {
       if (pat.revoked || isExpired(pat)) continue;
@@ -64,65 +64,70 @@ function resolveToken(token: string, getUsers: () => UserWithTokens[]): { user: 
   return null;
 }
 
-function agentAuth(
-  req: FastifyRequest,
-  reply: FastifyReply,
-  getUsers: () => UserWithTokens[],
-): { user: UserWithTokens; pat: PatRecord } | null {
+function agentAuth(req: FastifyRequest, reply: FastifyReply, getUsers: () => UserWithTokens[]): { user: UserWithTokens; pat: PatRecord } | null {
   const token = extractBearer(req);
-  if (!token) {
-    reply.code(401).send({ error: 'Missing or invalid Authorization header' });
-    return null;
-  }
+  if (!token) { reply.code(401).send({ error: 'unauthorized', message: 'Missing or invalid Authorization header' }); return null; }
   const result = resolveToken(token, getUsers);
-  if (!result) {
-    reply.code(401).send({ error: 'Invalid or expired token' });
-    return null;
-  }
+  if (!result) { reply.code(401).send({ error: 'unauthorized', message: 'Invalid or expired token' }); return null; }
   return result;
 }
 
 function canAccessInstance(user: UserWithTokens, pat: PatRecord, instanceId: string): boolean {
   if (!userCanAccess(user, instanceId)) return false;
-  if (pat.instanceIds && pat.instanceIds.length > 0) {
-    return pat.instanceIds.includes(instanceId);
-  }
+  if (pat.instanceIds && pat.instanceIds.length > 0) return pat.instanceIds.includes(instanceId);
   return true;
 }
 
-function getInstanceOrFail(
-  reply: FastifyReply,
-  user: UserWithTokens,
-  pat: PatRecord,
-  instanceId: string,
-): Instance | null {
+function getInstanceOrFail(reply: FastifyReply, user: UserWithTokens, pat: PatRecord, instanceId: string): Instance | null {
   const inst = findInstance(instanceId);
-  if (!inst) {
-    reply.code(404).send({ error: 'Instance not found' });
-    return null;
-  }
-  if (!canAccessInstance(user, pat, instanceId)) {
-    reply.code(403).send({ error: 'Token does not have access to this instance' });
-    return null;
-  }
+  if (!inst) { reply.code(404).send({ error: 'not_found', message: 'Instance not found' }); return null; }
+  if (!canAccessInstance(user, pat, instanceId)) { reply.code(403).send({ error: 'forbidden', message: 'Token does not have access to this instance' }); return null; }
   return inst;
 }
 
+// Helper: run tg command with auto-init and semantic error handling
+async function tgWithInit(
+  inst: Instance,
+  fn: () => Promise<TgExecResult>,
+  reply: FastifyReply,
+): Promise<TgExecResult | null> {
+  const initResult = await ensureInitialized(inst);
+  if (initResult) {
+    const initErr = classifyError(initResult);
+    if (initErr && initErr.code !== 'not_initialized') {
+      reply.code(502).send({ error: initErr.code, message: initErr.message });
+      return null;
+    }
+  }
+  const result = await fn();
+  const err = classifyError(result);
+  if (err) {
+    reply.code(502).send({ error: err.code, message: err.message, detail: result.stderr || result.stdout });
+    return null;
+  }
+  return result;
+}
+
+// Return text output as { raw: ... } or try JSON parse
+function formatOutput(result: TgExecResult) {
+  const text = result.stdout.trim();
+  try { return JSON.parse(text); } catch { return { raw: text }; }
+}
+
 export function registerAgentRoutes(app: FastifyInstance, getUsers: () => UserWithTokens[], persist: () => void) {
-  // List accessible instances
+
+  // === Instance management ===
   app.get('/api/agent/instances', async (req, reply) => {
     const auth = agentAuth(req, reply, getUsers);
     if (!auth) return;
-    const { user, pat } = auth;
-    let instances = userInstances(user);
-    if (pat.instanceIds && pat.instanceIds.length > 0) {
-      const allowed = new Set(pat.instanceIds);
+    let instances = userInstances(auth.user);
+    if (auth.pat.instanceIds?.length) {
+      const allowed = new Set(auth.pat.instanceIds);
       instances = instances.filter((i: Instance) => allowed.has(i.id));
     }
     return { instances: instances.map((i: Instance) => ({ id: i.id, name: i.name })) };
   });
 
-  // Instance status
   app.get('/api/agent/instances/:id/status', async (req, reply) => {
     const auth = agentAuth(req, reply, getUsers);
     if (!auth) return;
@@ -133,7 +138,19 @@ export function registerAgentRoutes(app: FastifyInstance, getUsers: () => UserWi
     return { instanceId: id, runtime, wechat };
   });
 
-  // tg sessions
+  // === Data endpoints (auto-init) ===
+  app.post('/api/agent/instances/:id/refresh', async (req, reply) => {
+    const auth = agentAuth(req, reply, getUsers);
+    if (!auth) return;
+    const { id } = req.params as { id: string };
+    const inst = getInstanceOrFail(reply, auth.user, auth.pat, id);
+    if (!inst) return;
+    const result = await tgRefresh(inst);
+    const err = classifyError(result);
+    if (err) return { ok: false, error: err.code, message: err.message };
+    return { ok: true, detail: result.stdout };
+  });
+
   app.get('/api/agent/instances/:id/sessions', async (req, reply) => {
     const auth = agentAuth(req, reply, getUsers);
     if (!auth) return;
@@ -143,12 +160,22 @@ export function registerAgentRoutes(app: FastifyInstance, getUsers: () => UserWi
     const q = req.query as Record<string, string>;
     const args: string[] = [];
     if (q.top) args.push('--top', q.top);
-    const result = await tgSessions(inst, args);
-    if (!result.ok) return reply.code(502).send({ error: 'tg sessions failed', detail: result.stderr });
-    try { return JSON.parse(result.stdout); } catch { return { raw: result.stdout }; }
+    const result = await tgWithInit(inst, () => tgSessions(inst, args), reply);
+    if (!result) return;
+    return formatOutput(result);
   });
 
-  // tg messages
+  app.get('/api/agent/instances/:id/unread', async (req, reply) => {
+    const auth = agentAuth(req, reply, getUsers);
+    if (!auth) return;
+    const { id } = req.params as { id: string };
+    const inst = getInstanceOrFail(reply, auth.user, auth.pat, id);
+    if (!inst) return;
+    const result = await tgWithInit(inst, () => tgUnread(inst), reply);
+    if (!result) return;
+    return formatOutput(result);
+  });
+
   app.get('/api/agent/instances/:id/messages', async (req, reply) => {
     const auth = agentAuth(req, reply, getUsers);
     if (!auth) return;
@@ -156,17 +183,19 @@ export function registerAgentRoutes(app: FastifyInstance, getUsers: () => UserWi
     const inst = getInstanceOrFail(reply, auth.user, auth.pat, id);
     if (!inst) return;
     const q = req.query as Record<string, string>;
-    if (!q.session) return reply.code(400).send({ error: 'session query parameter required' });
+    if (!q.session) return reply.code(400).send({ error: 'bad_request', message: 'session query parameter required' });
     const args: string[] = [];
     if (q.limit) args.push('--limit', q.limit);
     if (q.since) args.push('--since', q.since);
     if (q.all_time === 'true') args.push('--all-time');
-    const result = await tgMessages(inst, q.session, args);
-    if (!result.ok) return reply.code(502).send({ error: 'tg messages failed', detail: result.stderr });
-    try { return JSON.parse(result.stdout); } catch { return { raw: result.stdout }; }
+    if (q.offset) args.push('--offset', q.offset);
+    if (q.search) args.push('--search', q.search);
+    if (q.time_bucket) args.push('--time-bucket', q.time_bucket);
+    const result = await tgWithInit(inst, () => tgMessages(inst, q.session, args), reply);
+    if (!result) return;
+    return formatOutput(result);
   });
 
-  // tg search
   app.get('/api/agent/instances/:id/search', async (req, reply) => {
     const auth = agentAuth(req, reply, getUsers);
     if (!auth) return;
@@ -174,17 +203,16 @@ export function registerAgentRoutes(app: FastifyInstance, getUsers: () => UserWi
     const inst = getInstanceOrFail(reply, auth.user, auth.pat, id);
     if (!inst) return;
     const q = req.query as Record<string, string>;
-    if (!q.q) return reply.code(400).send({ error: 'q query parameter required' });
+    if (!q.q) return reply.code(400).send({ error: 'bad_request', message: 'q query parameter required' });
     const args: string[] = [];
     if (q.limit) args.push('--limit', q.limit);
     if (q.since) args.push('--since', q.since);
     if (q.all_time === 'true') args.push('--all-time');
-    const result = await tgSearch(inst, q.q, args);
-    if (!result.ok) return reply.code(502).send({ error: 'tg search failed', detail: result.stderr });
-    try { return JSON.parse(result.stdout); } catch { return { raw: result.stdout }; }
+    const result = await tgWithInit(inst, () => tgSearch(inst, q.q, args), reply);
+    if (!result) return;
+    return formatOutput(result);
   });
 
-  // tg query
   app.post('/api/agent/instances/:id/query', async (req, reply) => {
     const auth = agentAuth(req, reply, getUsers);
     if (!auth) return;
@@ -200,23 +228,11 @@ export function registerAgentRoutes(app: FastifyInstance, getUsers: () => UserWi
     if (body.fields) args.push('--fields', body.fields);
     if (body.limit) args.push('--limit', String(body.limit));
     if (body.all_time) args.push('--all-time');
-    const result = await tgQuery(inst, args);
-    if (!result.ok) return reply.code(502).send({ error: 'tg query failed', detail: result.stderr });
-    try { return JSON.parse(result.stdout); } catch { return { raw: result.stdout }; }
+    const result = await tgWithInit(inst, () => tgQuery(inst, args), reply);
+    if (!result) return;
+    return formatOutput(result);
   });
 
-  // tg refresh
-  app.post('/api/agent/instances/:id/refresh', async (req, reply) => {
-    const auth = agentAuth(req, reply, getUsers);
-    if (!auth) return;
-    const { id } = req.params as { id: string };
-    const inst = getInstanceOrFail(reply, auth.user, auth.pat, id);
-    if (!inst) return;
-    const result = await tgRefresh(inst);
-    return { ok: result.ok, detail: result.ok ? result.stdout : result.stderr };
-  });
-
-  // tg doctor
   app.get('/api/agent/instances/:id/doctor', async (req, reply) => {
     const auth = agentAuth(req, reply, getUsers);
     if (!auth) return;
@@ -225,11 +241,88 @@ export function registerAgentRoutes(app: FastifyInstance, getUsers: () => UserWi
     if (!inst) return;
     const q = req.query as Record<string, string>;
     const result = await tgDoctor(inst, q.session);
-    if (!result.ok) return reply.code(502).send({ error: 'tg doctor failed', detail: result.stderr });
-    try { return JSON.parse(result.stdout); } catch { return { raw: result.stdout }; }
+    return formatOutput(result);
   });
 
-  // --- PAT management (cookie-authed, for the web UI) ---
+  // === Export ===
+  app.post('/api/agent/instances/:id/export', async (req, reply) => {
+    const auth = agentAuth(req, reply, getUsers);
+    if (!auth) return;
+    const { id } = req.params as { id: string };
+    const inst = getInstanceOrFail(reply, auth.user, auth.pat, id);
+    if (!inst) return;
+    const body = (req.body as any) ?? {};
+    if (!body.session) return reply.code(400).send({ error: 'bad_request', message: 'session field required' });
+    const args: string[] = [];
+    if (body.since) args.push('--since', body.since);
+    const result = await tgWithInit(inst, () => tgExport(inst, body.session, args), reply);
+    if (!result) return;
+    // Read exported files
+    const files = await listFilesInContainer(inst, '/tmp/tg-export');
+    return { ok: true, files, detail: result.stdout };
+  });
+
+  // === Media: list ===
+  app.get('/api/agent/instances/:id/media/:type/list', async (req, reply) => {
+    const auth = agentAuth(req, reply, getUsers);
+    if (!auth) return;
+    const { id, type } = req.params as { id: string; type: string };
+    if (!['image', 'file', 'sticker', 'voice'].includes(type))
+      return reply.code(400).send({ error: 'bad_request', message: 'type must be image, file, sticker, or voice' });
+    const inst = getInstanceOrFail(reply, auth.user, auth.pat, id);
+    if (!inst) return;
+    const q = req.query as Record<string, string>;
+    if (!q.session) return reply.code(400).send({ error: 'bad_request', message: 'session query parameter required' });
+    const args = ['--list'];
+    if (q.limit) args.push('--limit', q.limit);
+    if (q.since) args.push('--since', q.since);
+    const result = await tgWithInit(inst, () => tgMedia(inst, type as any, q.session, args), reply);
+    if (!result) return;
+    return formatOutput(result);
+  });
+
+  // === Media: export single by index ===
+  app.get('/api/agent/instances/:id/media/:type/export', async (req, reply) => {
+    const auth = agentAuth(req, reply, getUsers);
+    if (!auth) return;
+    const { id, type } = req.params as { id: string; type: string };
+    if (!['image', 'file', 'sticker', 'voice'].includes(type))
+      return reply.code(400).send({ error: 'bad_request', message: 'type must be image, file, sticker, or voice' });
+    const inst = getInstanceOrFail(reply, auth.user, auth.pat, id);
+    if (!inst) return;
+    const q = req.query as Record<string, string>;
+    if (!q.session) return reply.code(400).send({ error: 'bad_request', message: 'session query parameter required' });
+    const args: string[] = [];
+    if (q.index) args.push('--index', q.index);
+    else if (q.id) args.push('--id', q.id);
+    else args.push('--index', '1'); // default: latest
+    const result = await tgWithInit(inst, () => tgMedia(inst, type as any, q.session, args), reply);
+    if (!result) return;
+    // tg outputs the exported file path on stdout
+    const filePath = result.stdout.trim().split('\n').pop()?.trim();
+    if (!filePath || filePath.startsWith('[') || filePath.startsWith('No ')) {
+      return reply.code(404).send({ error: 'not_found', message: 'No media file found', detail: result.stdout });
+    }
+    try {
+      const buf = await readFileFromContainer(inst, filePath);
+      const filename = filePath.split('/').pop() || 'file';
+      const ext = filename.split('.').pop()?.toLowerCase() || '';
+      const mimeMap: Record<string, string> = {
+        jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
+        pdf: 'application/pdf', mp4: 'video/mp4', mp3: 'audio/mpeg', wav: 'audio/wav',
+        voice: 'application/octet-stream', silk: 'audio/silk',
+      };
+      const contentType = mimeMap[ext] || 'application/octet-stream';
+      reply.header('Content-Type', contentType);
+      reply.header('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+      reply.header('X-TG-File-Path', filePath);
+      return reply.send(buf);
+    } catch (e: any) {
+      return reply.code(500).send({ error: 'file_read_error', message: e.message });
+    }
+  });
+
+  // === PAT management (cookie-authed) ===
   app.get('/api/account/tokens', async (req, reply) => {
     const cookie = (req as any).cookies?.woc_sess;
     const session = cookie ? (await import('./sessions.js')).getSession(cookie) : null;
