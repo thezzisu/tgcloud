@@ -63,8 +63,11 @@ COPY 3rd/WechatOnCloud/docker/wechat-ctl.sh /woc/wechat-ctl.sh
 RUN chmod +x /woc/wechat-ctl.sh
 
 # Autostart + update hook
-COPY 3rd/WechatOnCloud/docker/autostart /defaults/autostart
-RUN chmod +x /defaults/autostart
+# Wrap upstream autostart with light background for visibility
+COPY 3rd/WechatOnCloud/docker/autostart /defaults/autostart.upstream
+RUN chmod +x /defaults/autostart.upstream && \
+    printf '#!/bin/bash\n# Set light background so WeChat window is visible on the VNC canvas\nxsetroot -solid "#ededed" 2>/dev/null || true\nexec /defaults/autostart.upstream "$@"\n' > /defaults/autostart && \
+    chmod +x /defaults/autostart
 COPY 3rd/WechatOnCloud/docker/woc-update-autostart /custom-cont-init.d/01-woc-autostart
 RUN chmod +x /custom-cont-init.d/01-woc-autostart
 
