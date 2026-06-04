@@ -75,4 +75,8 @@ RUN chmod +x /custom-cont-init.d/01-woc-autostart
 COPY --from=tg-builder /build/target/release/tg /usr/local/bin/tg
 RUN chmod +x /usr/local/bin/tg
 
+# tg expects ~/Documents/xwechat_files but WeChat Linux stores at ~/xwechat_files
+# Create symlink so tg can auto-detect the DB path
+RUN mkdir -p /config/Documents && ln -sf /config/xwechat_files /config/Documents/xwechat_files
+
 EXPOSE 3000 3001

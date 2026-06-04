@@ -37,6 +37,9 @@ COPY images/panel/overlay/server/src/agent.ts ./src/agent.ts
 RUN sed -i 's|^function persist()|export function persistStore() { persist(); }\nfunction persist()|' src/store.ts && \
     sed -i '/^export function initStore/i export function listUsersRaw(): any[] { return data.users; }' src/store.ts
 
+# Patch docker.ts: add CAP_SYS_PTRACE for tg key extraction from WeChat process memory
+RUN sed -i "s|SecurityOpt: \['seccomp=unconfined'\]|SecurityOpt: ['seccomp=unconfined'], CapAdd: ['SYS_PTRACE']|" src/docker.ts
+
 # Patch index.ts: import and register agent routes before await app.ready()
 RUN sed -i "1i import { registerAgentRoutes } from './agent.js';" src/index.ts && \
     sed -i "2i import { listUsersRaw, persistStore } from './store.js';" src/index.ts && \
