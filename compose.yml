@@ -1,5 +1,4 @@
-# tgcloud — 微信 GUI (WOC) + Agent REST API
-# Panel is the sole entrypoint; WeChat instances are created dynamically by the panel.
+# tgcloud
 services:
   panel:
     image: ${TGCLOUD_IMAGE_PREFIX:-git.pku.edu.cn/thezzisu}/tgcloud-panel:${TGCLOUD_VERSION:-latest}

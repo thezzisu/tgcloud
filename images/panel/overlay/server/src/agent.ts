@@ -30,6 +30,7 @@ import {
   ensureInitialized,
   classifyError,
   readFileFromContainer,
+  execInContainer,
   listFilesInContainer,
   type TgExecResult,
 } from './tg-exec.js';
@@ -85,33 +86,82 @@ function getInstanceOrFail(reply: FastifyReply, user: UserWithTokens, pat: PatRe
   return inst;
 }
 
-// Helper: run tg command with auto-init and semantic error handling
+const RETRY_DELAY_MS = 2000;
+const MAX_RETRIES = 15; // 15 * 2s = 30s max wait for lock release
+
+function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+
+// Helper: run tg command with auto-init, spin-retry on refresh_locked, and semantic error handling
 async function tgWithInit(
   inst: Instance,
   fn: () => Promise<TgExecResult>,
   reply: FastifyReply,
 ): Promise<TgExecResult | null> {
-  const initResult = await ensureInitialized(inst);
-  if (initResult) {
+  // Auto-init with retry: if another request is refreshing, wait and retry
+  for (let attempt = 0; ; attempt++) {
+    const initResult = await ensureInitialized(inst);
+    if (!initResult) break; // already initialized
     const initErr = classifyError(initResult);
+    if (initErr?.code === 'refresh_locked' && attempt < MAX_RETRIES) {
+      await sleep(RETRY_DELAY_MS);
+      continue;
+    }
     if (initErr && initErr.code !== 'not_initialized') {
       reply.code(502).send({ error: initErr.code, message: initErr.message });
       return null;
     }
+    break;
   }
-  const result = await fn();
-  const err = classifyError(result);
-  if (err) {
-    reply.code(502).send({ error: err.code, message: err.message, detail: result.stderr || result.stdout });
-    return null;
+  // Run command with retry
+  for (let attempt = 0; ; attempt++) {
+    const result = await fn();
+    const err = classifyError(result);
+    if (err?.code === 'refresh_locked' && attempt < MAX_RETRIES) {
+      await sleep(RETRY_DELAY_MS);
+      continue;
+    }
+    if (err) {
+      reply.code(502).send({ error: err.code, message: err.message, detail: result.stderr || result.stdout });
+      return null;
+    }
+    return result;
   }
-  return result;
 }
 
 // Return text output as { raw: ... } or try JSON parse
 function formatOutput(result: TgExecResult) {
   const text = result.stdout.trim();
-  try { return JSON.parse(text); } catch { return { raw: text }; }
+  try { return JSON.parse(text); } catch {}
+  // Try NDJSON (one JSON object per line, e.g. from `tg query --format json`)
+  const lines = text.split('\n').filter(l => l.startsWith('{'));
+  if (lines.length > 0) {
+    try {
+      const results = lines.map(l => JSON.parse(l));
+      return { results };
+    } catch {}
+  }
+  return { raw: text };
+}
+
+// Like formatOutput but always wraps JSON objects in { results: [...] } for consistent array response
+function formatQueryOutput(result: TgExecResult) {
+  const text = result.stdout.trim();
+  if (!text) return { results: [] };
+  const lines = text.split('\n').filter(l => l.trim().startsWith('{'));
+  if (lines.length > 0) {
+    try {
+      const results = lines.map(l => JSON.parse(l));
+      return { results };
+    } catch {}
+  }
+  // Fallback: try single JSON parse
+  try {
+    const obj = JSON.parse(text);
+    return { results: Array.isArray(obj) ? obj : [obj] };
+  } catch {}
+  // tg outputs "No rows returned." when there are zero matches
+  if (text.startsWith('No rows') || text.startsWith('No messages')) return { results: [] };
+  return { raw: text };
 }
 
 export function registerAgentRoutes(app: FastifyInstance, getUsers: () => UserWithTokens[], persist: () => void) {
@@ -230,7 +280,7 @@ export function registerAgentRoutes(app: FastifyInstance, getUsers: () => UserWi
     if (body.all_time) args.push('--all-time');
     const result = await tgWithInit(inst, () => tgQuery(inst, args), reply);
     if (!result) return;
-    return formatOutput(result);
+    return formatQueryOutput(result);
   });
 
   app.get('/api/agent/instances/:id/doctor', async (req, reply) => {
@@ -320,6 +370,52 @@ export function registerAgentRoutes(app: FastifyInstance, getUsers: () => UserWi
     } catch (e: any) {
       return reply.code(500).send({ error: 'file_read_error', message: e.message });
     }
+  });
+
+  // === Read arbitrary file from container (for embedded media like forwarded record images) ===
+  app.get('/api/agent/instances/:id/file', async (req, reply) => {
+    const auth = agentAuth(req, reply, getUsers);
+    if (!auth) return;
+    const { id } = req.params as { id: string };
+    const inst = getInstanceOrFail(reply, auth.user, auth.pat, id);
+    if (!inst) return;
+    const q = req.query as Record<string, string>;
+    if (!q.path) return reply.code(400).send({ error: 'bad_request', message: 'path query parameter required' });
+    // Security: only allow paths under /config
+    if (!q.path.startsWith('/config/')) {
+      return reply.code(403).send({ error: 'forbidden', message: 'Only paths under /config/ are allowed' });
+    }
+    try {
+      const buf = await readFileFromContainer(inst, q.path);
+      if (buf.length === 0) return reply.code(404).send({ error: 'not_found', message: 'File not found or empty' });
+      const filename = q.path.split('/').pop() || 'file';
+      const ext = filename.split('.').pop()?.toLowerCase() || '';
+      const mimeMap: Record<string, string> = {
+        jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
+        dat: 'application/octet-stream', pdf: 'application/pdf', mp4: 'video/mp4',
+      };
+      reply.header('Content-Type', mimeMap[ext] || 'application/octet-stream');
+      reply.header('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+      return reply.send(buf);
+    } catch (e: any) {
+      return reply.code(500).send({ error: 'file_read_error', message: e.message });
+    }
+  });
+
+  // === Scan temp image cache (for forwarded record images viewed in WeChat) ===
+  app.get('/api/agent/instances/:id/temp-images', async (req, reply) => {
+    const auth = agentAuth(req, reply, getUsers);
+    if (!auth) return;
+    const { id } = req.params as { id: string };
+    const inst = getInstanceOrFail(reply, auth.user, auth.pat, id);
+    if (!inst) return;
+    const result = await execInContainer(inst, [
+      'find', '/config/xwechat_files', '-type', 'f',
+      '(', '-path', '*/temp/ImageUtils/*', '-o', '-path', '*/temp/ImageTemp/*', ')',
+    ]);
+    if (!result.ok) return reply.code(500).send({ error: 'unknown', message: result.stderr });
+    const files = result.stdout.trim().split('\n').filter(Boolean);
+    return { files: files.map(f => ({ path: f, name: f.split('/').pop() })) };
   });
 
   // === PAT management (cookie-authed) ===

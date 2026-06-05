@@ -32,10 +32,12 @@ export interface TgSemanticError {
 
 export function classifyError(result: TgExecResult): TgSemanticError | null {
   const out = result.stdout + result.stderr;
+  // tg commands may warn about lock contention in stderr but still succeed.
+  // Only treat refresh_locked as an error when the command itself failed.
+  if (!result.ok && (out.includes('already running') || out.includes('refresh.lock')))
+    return { code: 'refresh_locked', message: 'A refresh is already in progress. Try again later.' };
   if (out.includes('decrypted cache is still incomplete'))
     return { code: 'not_logged_in', message: 'Cannot decrypt databases. WeChat may not be logged in or keys are unavailable.' };
-  if (out.includes('already running') || out.includes('refresh.lock'))
-    return { code: 'refresh_locked', message: 'A refresh is already in progress. Try again later.' };
   if (out.includes('No match for'))
     return { code: 'session_not_found', message: 'Session not found. Check the session name or ID.' };
   if (out.includes('[tg-exec] timeout'))
@@ -44,7 +46,6 @@ export function classifyError(result: TgExecResult): TgSemanticError | null {
     return { code: 'wechat_not_running', message: 'WeChat is not running in this instance.' };
   if (out.includes('ptrace') || out.includes('permission error'))
     return { code: 'ptrace_denied', message: 'Key extraction denied. Instance may lack CAP_SYS_PTRACE.' };
-  // Only report 0 keys as not_logged_in when the command itself failed
   if (!result.ok && (out.includes('0 unique key candidates') || out.includes('Found 0 database keys')))
     return { code: 'not_logged_in', message: 'WeChat is not logged in or has not loaded databases yet. Please log in via the VNC interface.' };
   if (out.includes('No sessions found') || out.includes('keys: MISSING'))
@@ -75,7 +76,7 @@ export async function ensureInitialized(inst: Instance): Promise<TgExecResult | 
   return tgRefresh(inst);
 }
 
-function execInContainer(
+export function execInContainer(
   inst: Instance,
   cmd: string[],
   opts: { user?: string; timeout?: number } = {},
