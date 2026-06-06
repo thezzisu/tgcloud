@@ -17,6 +17,8 @@ docker compose up -d
 
 浏览器打开 `http://HOST:36080`，用 `.env` 中的账号登录面板，创建实例后通过 VNC 完成客户端登录。
 
+详细部署步骤：见 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
+
 ## Agent API
 
 所有 `/api/agent/` 端点使用 PAT 鉴权：
