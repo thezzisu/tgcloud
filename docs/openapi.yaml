@@ -19,6 +19,19 @@ components:
       type: http
       scheme: bearer
       description: 'Personal Access Token: tgcp_...'
+  responses:
+    SemanticError:
+      description: |
+        All agent endpoints share a common semantic-error envelope:
+        `{ error: <code>, message: <human-readable>, detail?: <raw output> }`.
+        Common codes:
+        - `media_not_downloaded` (409): user must open the message in WeChat UI first
+        - `session_not_found` (404)
+        - `not_logged_in` (401): scan QR via VNC to log in
+        - `not_initialized` (503): call POST /refresh, or wait for auto-init
+        - `wechat_not_running` (503)
+        - `refresh_locked` (503): another refresh in progress; retry
+        - `timeout` (504)
 
 paths:
   /api/agent/instances:
@@ -188,3 +201,149 @@ paths:
       responses:
         '200':
           description: JSON output from tg doctor
+
+  /api/agent/instances/{id}/media/{type}/list:
+    get:
+      summary: List media messages of a given type from a session
+      description: |
+        Returns a list of media entries with their cache status. Each entry has a
+        `status` of `cached` (file is on disk and exportable) or `missing` (the user
+        has not opened/downloaded the original yet — the panel cannot fetch it).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: type
+          in: path
+          required: true
+          schema: { type: string, enum: [image, file, sticker, voice] }
+        - name: session
+          in: query
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer }
+        - name: since
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: List of media entries with cache status
+
+  /api/agent/instances/{id}/media/{type}/export:
+    get:
+      summary: Export a single media file (binary stream)
+      description: |
+        Decrypts and returns the requested media file as a binary stream. Only files
+        already downloaded to the local WeChat cache can be exported. Use the
+        `/media/{type}/list` endpoint first to check the `status` field.
+
+        **HD images and original files require the user to have opened the message
+        in the WeChat UI at least once.** WeChat caches the thumbnail automatically,
+        but the HD original is only fetched from the CDN when the user taps/clicks
+        the message. If the file is missing, the panel returns HTTP 409
+        `media_not_downloaded`. The agent should surface a message asking the user
+        to open the message via the VNC desktop, then retry.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: type
+          in: path
+          required: true
+          schema: { type: string, enum: [image, file, sticker, voice] }
+        - name: session
+          in: query
+          required: true
+          schema: { type: string }
+        - name: index
+          in: query
+          description: 1-based index from the list endpoint
+          schema: { type: integer }
+        - name: id
+          in: query
+          description: Server message id (alternative to index)
+          schema: { type: string }
+      responses:
+        '200':
+          description: Binary file stream
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '409':
+          description: |
+            `media_not_downloaded` — file has not been cached by WeChat yet.
+            Open the message in the WeChat UI (via VNC) so the user can tap it,
+            then retry.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, enum: [media_not_downloaded] }
+                  message: { type: string }
+        '404':
+          description: '`not_found` — no media of the requested index/id'
+
+  /api/agent/instances/{id}/forwarded-images/list:
+    get:
+      summary: List images embedded in forwarded chat records
+      description: |
+        Forwarded-record (recordtype) messages embed copies of images under
+        `<attach>/<session-hash>/<month>/Rec/<record-id>/Img/<n>[_t]`. This endpoint
+        lists those entries (one per file, with `is_thumb` flag).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: session
+          in: query
+          required: true
+          schema: { type: string }
+        - name: includeThumbs
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: List of forwarded image entries
+
+  /api/agent/instances/{id}/forwarded-images/export:
+    get:
+      summary: Export forwarded-record image(s) by record-id, item, or index
+      description: |
+        Returns the decrypted image as a binary stream when a single image is
+        addressed, or a JSON manifest of multiple paths when a full record-id is
+        requested. As with the regular media endpoint, only files already present
+        in the local WeChat cache can be exported.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: session
+          in: query
+          required: true
+          schema: { type: string }
+        - name: recordId
+          in: query
+          schema: { type: string }
+        - name: item
+          in: query
+          schema: { type: string }
+        - name: index
+          in: query
+          schema: { type: integer }
+        - name: includeThumbs
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: Binary file or JSON manifest
+        '409':
+          description: '`media_not_downloaded` — see /media/{type}/export'
+        '404':
+          description: '`not_found` — no matching images'

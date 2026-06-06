@@ -22,6 +22,7 @@ export type TgErrorCode =
   | 'wechat_not_running'
   | 'ptrace_denied'
   | 'session_not_found'
+  | 'media_not_downloaded'
   | 'timeout'
   | 'unknown';
 
@@ -40,6 +41,17 @@ export function classifyError(result: TgExecResult): TgSemanticError | null {
     return { code: 'not_logged_in', message: 'Cannot decrypt databases. WeChat may not be logged in or keys are unavailable.' };
   if (out.includes('No match for'))
     return { code: 'session_not_found', message: 'Session not found. Check the session name or ID.' };
+  // Image / file / voice not downloaded yet — WeChat caches HD originals only after the user views them.
+  // tg surfaces this as e.g. "Image #3 is not available in local Telegram cache" or
+  // "File #5 is not available in local Telegram cache".
+  if (out.match(/is not available in local Telegram cache/))
+    return {
+      code: 'media_not_downloaded',
+      message:
+        'The HD original of this media has not been downloaded to the WeChat client yet. ' +
+        'Please open the message in the WeChat UI (via VNC) so the user can tap/click it; ' +
+        'WeChat will then fetch the file from the CDN and cache it locally. Retry afterwards.',
+    };
   if (out.includes('[tg-exec] timeout'))
     return { code: 'timeout', message: 'Command timed out.' };
   if (out.includes('Telegram is not running') || out.includes('not running'))
@@ -170,7 +182,7 @@ export async function tgMedia(
   session: string,
   args: string[] = [],
 ): Promise<TgExecResult> {
-  return execInContainer(inst, [TG_BIN, type, session, '--output', `/tmp/tg-media-${type}`, ...args], { timeout: MEDIA_TIMEOUT_MS });
+  return execInContainer(inst, [TG_BIN, type, session, '--output', `/tmp/tg-media-${type}`, ...args], { user: 'root', timeout: MEDIA_TIMEOUT_MS });
 }
 
 export async function tgForwardedImage(
@@ -178,7 +190,7 @@ export async function tgForwardedImage(
   session: string,
   args: string[] = [],
 ): Promise<TgExecResult> {
-  return execInContainer(inst, [TG_BIN, 'forwarded-image', session, '--output', '/tmp/tg-forwarded-images', ...args], { timeout: MEDIA_TIMEOUT_MS });
+  return execInContainer(inst, [TG_BIN, 'forwarded-image', session, '--output', '/tmp/tg-forwarded-images', ...args], { user: 'root', timeout: MEDIA_TIMEOUT_MS });
 }
 
 // Read a file from the container and return as Buffer

@@ -122,7 +122,20 @@ async function tgWithInit(
       continue;
     }
     if (err) {
-      reply.code(502).send({ error: err.code, message: err.message, detail: result.stderr || result.stdout });
+      // Map error code → HTTP status. 502 is reserved for true upstream failures;
+      // user-actionable conditions get more accurate codes.
+      const statusByCode: Record<string, number> = {
+        media_not_downloaded: 409,
+        session_not_found: 404,
+        not_logged_in: 401,
+        not_initialized: 503,
+        wechat_not_running: 503,
+        ptrace_denied: 500,
+        refresh_locked: 503,
+        timeout: 504,
+      };
+      const code = statusByCode[err.code] ?? 502;
+      reply.code(code).send({ error: err.code, message: err.message, detail: result.stderr || result.stdout });
       return null;
     }
     return result;
