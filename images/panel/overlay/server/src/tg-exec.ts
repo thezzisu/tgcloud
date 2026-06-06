@@ -173,6 +173,14 @@ export async function tgMedia(
   return execInContainer(inst, [TG_BIN, type, session, '--output', `/tmp/tg-media-${type}`, ...args], { timeout: MEDIA_TIMEOUT_MS });
 }
 
+export async function tgForwardedImage(
+  inst: Instance,
+  session: string,
+  args: string[] = [],
+): Promise<TgExecResult> {
+  return execInContainer(inst, [TG_BIN, 'forwarded-image', session, '--output', '/tmp/tg-forwarded-images', ...args], { timeout: MEDIA_TIMEOUT_MS });
+}
+
 // Read a file from the container and return as Buffer
 export async function readFileFromContainer(inst: Instance, path: string): Promise<Buffer> {
   const c = docker.getContainer(inst.containerName);

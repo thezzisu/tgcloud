@@ -27,6 +27,7 @@ import {
   tgDoctor,
   tgExport,
   tgMedia,
+  tgForwardedImage,
   ensureInitialized,
   classifyError,
   readFileFromContainer,
@@ -162,6 +163,31 @@ function formatQueryOutput(result: TgExecResult) {
   // tg outputs "No rows returned." when there are zero matches
   if (text.startsWith('No rows') || text.startsWith('No messages')) return { results: [] };
   return { raw: text };
+}
+
+// Parse output of `tg forwarded-image --list`. Layout:
+//   Index Time                Record-Id          Item       Type        Size Path
+//   ----------...
+//   1     2026-06-05 19:40:31 102fd13a9c49d337   1_0        orig       687KB /config/...
+function parseForwardedList(stdout: string): { count: number; items: any[] } {
+  const items: any[] = [];
+  for (const raw of stdout.split('\n')) {
+    const line = raw.trimEnd();
+    if (!line || /^[\s-]+$/.test(line) || line.startsWith('Index')) continue;
+    // Match leading index + datetime + record + item + type + size + path
+    const m = line.match(/^\s*(\d+)\s+(\S+\s+\S+)\s+(\S+)\s+(\S+)\s+(orig|thumb)\s+(\S+)\s+(\/\S.*)$/);
+    if (!m) continue;
+    items.push({
+      index: parseInt(m[1], 10),
+      time: m[2],
+      recordId: m[3],
+      item: m[4],
+      type: m[5],
+      size: m[6],
+      path: m[7],
+    });
+  }
+  return { count: items.length, items };
 }
 
 export function registerAgentRoutes(app: FastifyInstance, getUsers: () => UserWithTokens[], persist: () => void) {
@@ -366,6 +392,78 @@ export function registerAgentRoutes(app: FastifyInstance, getUsers: () => UserWi
       reply.header('Content-Type', contentType);
       reply.header('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
       reply.header('X-TG-File-Path', filePath);
+      return reply.send(buf);
+    } catch (e: any) {
+      return reply.code(500).send({ error: 'file_read_error', message: e.message });
+    }
+  });
+
+  // === Forwarded chat-history embedded images ===
+  // List images embedded in forwarded-record (recordtype) messages.
+  // Backed by `tg forwarded-image --list`. Images live under
+  //   <attach>/<session-hash>/<month>/Rec/<record-id>/Img/<n>[_t]
+  // and are V2-encrypted .dat files; export will decrypt when media keys are available.
+  app.get('/api/agent/instances/:id/forwarded-images/list', async (req, reply) => {
+    const auth = agentAuth(req, reply, getUsers);
+    if (!auth) return;
+    const { id } = req.params as { id: string };
+    const inst = getInstanceOrFail(reply, auth.user, auth.pat, id);
+    if (!inst) return;
+    const q = req.query as Record<string, string>;
+    if (!q.session) return reply.code(400).send({ error: 'bad_request', message: 'session query parameter required' });
+    const args = ['--list'];
+    if (q.includeThumbs === '1' || q.includeThumbs === 'true') args.push('--include-thumbs');
+    const result = await tgWithInit(inst, () => tgForwardedImage(inst, q.session, args), reply);
+    if (!result) return;
+    return parseForwardedList(result.stdout);
+  });
+
+  // Export by record-id (+ optional item), by index, or all.
+  // Returns the decrypted image as a binary stream (Content-Type per detected ext).
+  app.get('/api/agent/instances/:id/forwarded-images/export', async (req, reply) => {
+    const auth = agentAuth(req, reply, getUsers);
+    if (!auth) return;
+    const { id } = req.params as { id: string };
+    const inst = getInstanceOrFail(reply, auth.user, auth.pat, id);
+    if (!inst) return;
+    const q = req.query as Record<string, string>;
+    if (!q.session) return reply.code(400).send({ error: 'bad_request', message: 'session query parameter required' });
+    const args: string[] = [];
+    if (q.recordId) {
+      args.push('--record-id', q.recordId);
+      if (q.item) args.push('--item', q.item);
+    } else if (q.index) {
+      args.push('--index', q.index);
+    } else {
+      return reply.code(400).send({ error: 'bad_request', message: 'recordId or index required' });
+    }
+    if (q.includeThumbs === '1' || q.includeThumbs === 'true') args.push('--include-thumbs');
+    const result = await tgWithInit(inst, () => tgForwardedImage(inst, q.session, args), reply);
+    if (!result) return;
+    const paths = result.stdout.split('\n').map(s => s.trim()).filter(p => p.startsWith('/'));
+    if (paths.length === 0) {
+      return reply.code(404).send({ error: 'not_found', message: 'No images exported', detail: result.stdout });
+    }
+    // If multiple paths returned (e.g. --record-id alone), return a JSON manifest.
+    if (paths.length > 1 && !q.item && !q.index) {
+      return { count: paths.length, files: paths };
+    }
+    const filePath = paths[0];
+    try {
+      const buf = await readFileFromContainer(inst, filePath);
+      if (buf.length === 0) return reply.code(404).send({ error: 'not_found', message: 'File empty or unreadable' });
+      const filename = filePath.split('/').pop() || 'file';
+      const ext = filename.split('.').pop()?.toLowerCase() || '';
+      const mimeMap: Record<string, string> = {
+        jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
+        bin: 'application/octet-stream', dat: 'application/octet-stream',
+      };
+      reply.header('Content-Type', mimeMap[ext] || 'application/octet-stream');
+      reply.header('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+      reply.header('X-TG-File-Path', filePath);
+      if (ext === 'bin' || ext === 'dat') {
+        reply.header('X-TG-Decryption', 'unavailable');
+      }
       return reply.send(buf);
     } catch (e: any) {
       return reply.code(500).send({ error: 'file_read_error', message: e.message });
