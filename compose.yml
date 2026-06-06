@@ -15,7 +15,12 @@ services:
       - PANEL_DATA=/data/accounts.json
     volumes:
       - ./data-panel:/data:z
-      - /var/run/docker.sock:/var/run/docker.sock:z
+      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "${TGCLOUD_HTTP_PORT:-36080}:8080"
+    # SELinux: panel must talk to docker.sock; the default container_t domain is
+    # denied connectto. Disable SELinux confinement just for this container.
+    # No-op on non-SELinux hosts.
+    security_opt:
+      - label=disable
     restart: unless-stopped
